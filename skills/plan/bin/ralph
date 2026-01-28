@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# Ralph Wiggum Board TUI
+# Requires: gum (charm.sh), jq
+
+set -e
+
+BOARD_FILE="${RALPH_BOARD:-.ralph-board.json}"
+
+# Colors
+C_BACKLOG="\033[0;37m"      # Gray
+C_PROGRESS="\033[0;33m"     # Yellow
+C_TESTING="\033[0;36m"      # Cyan
+C_BLOCKED="\033[0;31m"      # Red
+C_DONE="\033[0;32m"         # Green
+C_RESET="\033[0m"
+
+# Check dependencies
+check_deps() {
+    command -v gum >/dev/null 2>&1 || { echo "Error: gum not found. Install: brew install gum"; exit 1; }
+    command -v jq >/dev/null 2>&1 || { echo "Error: jq not found. Install: brew install jq"; exit 1; }
+}
+
+# Find board file
+find_board() {
+    if [[ -f "$BOARD_FILE" ]]; then
+        echo "$BOARD_FILE"
+    elif [[ -f ".ralph-board.json" ]]; then
+        echo ".ralph-board.json"
+    elif [[ -f "/tmp/ralph-board-$(basename $(pwd)).json" ]]; then
+        echo "/tmp/ralph-board-$(basename $(pwd)).json"
+    else
+        echo ""
+    fi
+}
+
+# Display the board
+cmd_board() {
+    local board=$(find_board)
+    if [[ -z "$board" ]]; then
+        gum style --foreground 196 "No board found. Run: ralph init \"project name\""
+        exit 1
+    fi
+
+    local project=$(jq -r '.project // "unnamed"' "$board")
+    local updated=$(jq -r '.updated // "unknown"' "$board")
+
+    # Header
+    gum style \
+        --border double \
+        --border-foreground 212 \
+        --padding "0 2" \
+        --margin "1 0" \
+        "RALPH BOARD: $project" \
+        "Updated: $updated"
+
+    # Get blocks by state
+    local backlog=$(jq -r '.blocks[] | select(.state == "backlog") | "[\(.id)] \(.title)"' "$board" 2>/dev/null || echo "")
+    local in_progress=$(jq -r '.blocks[] | select(.state == "in_progress") | "[\(.id)] \(.title) (iter \(.iteration // 0)/\(.max_iterations // 10))"' "$board" 2>/dev/null || echo "")
+    local testing=$(jq -r '.blocks[] | select(.state == "testing") | "[\(.id)] \(.title)"' "$board" 2>/dev/null || echo "")
+    local blocked=$(jq -r '.blocks[] | select(.state == "blocked") | "[\(.id)] \(.title)"' "$board" 2>/dev/null || echo "")
+    local done=$(jq -r '.blocks[] | select(.state == "done") | "[\(.id)] \(.title)"' "$board" 2>/dev/null || echo "")
+
+    # Display columns
+    echo ""
+    gum join --horizontal \
+        "$(gum style --foreground 245 --width 25 --border normal --padding "0 1" "BACKLOG" "" "${backlog:-"(empty)"}")" \
+        "$(gum style --foreground 220 --width 25 --border normal --padding "0 1" "IN PROGRESS" "" "${in_progress:-"(empty)"}")" \
+        "$(gum style --foreground 81 --width 25 --border normal --padding "0 1" "TESTING" "" "${testing:-"(empty)"}")" \
+        "$(gum style --foreground 82 --width 25 --border normal --padding "0 1" "DONE" "" "${done:-"(empty)"}")"
+
+    if [[ -n "$blocked" ]]; then
+        echo ""
+        gum style --foreground 196 --border normal --padding "0 1" "BLOCKED" "" "$blocked"
+    fi
+    echo ""
+}
+
+# Initialize a new board
+cmd_init() {
+    local project_name="${1:-$(basename $(pwd))}"
+    local board_file=".ralph-board.json"
+
+    if [[ -f "$board_file" ]]; then
+        gum confirm "Board already exists. Overwrite?" || exit 0
+    fi
+
+    cat > "$board_file" << EOF
+{
+  "project": "$project_name",
+  "created": "$(date -Iseconds)",
+  "updated": "$(date -Iseconds)",
+  "blocks": []
+}
+EOF
+
+    gum style --foreground 82 "Created board: $board_file"
+}
+
+# Add a block interactively
+cmd_add() {
+    local board=$(find_board)
+    if [[ -z "$board" ]]; then
+        gum style --foreground 196 "No board found. Run: ralph init"
+        exit 1
+    fi
+
+    local id=$(gum input --placeholder "block-id (kebab-case)")
+    local title=$(gum input --placeholder "Block title")
+    local description=$(gum input --placeholder "Description (optional)")
+    local promise=$(gum input --placeholder "Completion promise (required)")
+    local max_iter=$(gum input --placeholder "Max iterations" --value "10")
+    local test_cmd=$(gum input --placeholder "Test command (optional)")
+    local deps=$(gum input --placeholder "Dependencies (comma-separated block-ids, optional)")
+
+    # Convert deps to JSON array
+    local deps_json="[]"
+    if [[ -n "$deps" ]]; then
+        deps_json=$(echo "$deps" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+    fi
+
+    # Add block to board
+    local new_block=$(jq -n \
+        --arg id "$id" \
+        --arg title "$title" \
+        --arg desc "$description" \
+        --arg promise "$promise" \
+        --argjson max "$max_iter" \
+        --arg test "$test_cmd" \
+        --argjson deps "$deps_json" \
+        '{
+            id: $id,
+            title: $title,
+            description: $desc,
+            completion_promise: $promise,
+            max_iterations: $max,
+            test_command: (if $test == "" then null else $test end),
+            dependencies: $deps,
+            state: "backlog",
+            iteration: 0,
+            notes: []
+        }')
+
+    jq --argjson block "$new_block" '.blocks += [$block] | .updated = now | .updated = (now | todate)' "$board" > "${board}.tmp" && mv "${board}.tmp" "$board"
+
+    gum style --foreground 82 "Added block: $id"
+}
+
+# Pick a block to work on
+cmd_pick() {
+    local board=$(find_board)
+    if [[ -z "$board" ]]; then
+        gum style --foreground 196 "No board found."
+        exit 1
+    fi
+
+    # Check if something is already in progress
+    local current=$(jq -r '.blocks[] | select(.state == "in_progress") | .id' "$board" | head -1)
+    if [[ -n "$current" ]]; then
+        gum style --foreground 220 "Block '$current' is already in progress."
+        gum confirm "Move it back to backlog and pick a new one?" || exit 0
+        jq --arg id "$current" '(.blocks[] | select(.id == $id)).state = "backlog"' "$board" > "${board}.tmp" && mv "${board}.tmp" "$board"
+    fi
+
+    # Get available blocks (backlog with deps met)
+    local available=$(jq -r '
+        .blocks as $all |
+        .blocks[] |
+        select(.state == "backlog") |
+        select(
+            .dependencies == [] or
+            (.dependencies | all(. as $dep | $all | map(select(.id == $dep and .state == "done")) | length > 0))
+        ) |
+        .id + " - " + .title
+    ' "$board")
+
+    if [[ -z "$available" ]]; then
+        gum style --foreground 196 "No blocks available (check dependencies)"
+        exit 1
+    fi
+
+    local choice=$(echo "$available" | gum choose --header "Pick a block to work on:")
+    local block_id=$(echo "$choice" | cut -d' ' -f1)
+
+    jq --arg id "$block_id" '
+        (.blocks[] | select(.id == $id)).state = "in_progress" |
+        (.blocks[] | select(.id == $id)).iteration = 0 |
+        .updated = (now | todate)
+    ' "$board" > "${board}.tmp" && mv "${board}.tmp" "$board"
+
+    # Show block details
+    echo ""
+    jq -r --arg id "$block_id" '.blocks[] | select(.id == $id) |
+        "Block: \(.id)\nTitle: \(.title)\nPromise: \(.completion_promise)\nMax iterations: \(.max_iterations)\nTest: \(.test_command // "none")"
+    ' "$board" | gum style --border rounded --padding "1 2" --border-foreground 220
+
+    echo ""
+    gum style --foreground 220 "Block '$block_id' is now in progress. Good luck!"
+}
+
+# Increment iteration and add note
+cmd_iterate() {
+    local board=$(find_board)
+    local note="${1:-}"
+
+    local current=$(jq -r '.blocks[] | select(.state == "in_progress") | .id' "$board" | head -1)
+    if [[ -z "$current" ]]; then
+        gum style --foreground 196 "No block in progress. Run: ralph pick"
+        exit 1
+    fi
+
+    if [[ -z "$note" ]]; then
+        note=$(gum input --placeholder "What did you try/learn this iteration?")
+    fi
+
+    local iter=$(jq -r --arg id "$current" '.blocks[] | select(.id == $id) | .iteration' "$board")
+    local max=$(jq -r --arg id "$current" '.blocks[] | select(.id == $id) | .max_iterations' "$board")
+    local new_iter=$((iter + 1))
+
+    if [[ $new_iter -ge $max ]]; then
+        gum style --foreground 196 "Max iterations ($max) reached!"
+        gum confirm "Mark as blocked?" && cmd_blocked "$current" "Max iterations reached"
+        exit 0
+    fi
+
+    jq --arg id "$current" --arg note "Iter $new_iter: $note" --argjson iter "$new_iter" '
+        (.blocks[] | select(.id == $id)).iteration = $iter |
+        (.blocks[] | select(.id == $id)).notes += [$note] |
+        .updated = (now | todate)
+    ' "$board" > "${board}.tmp" && mv "${board}.tmp" "$board"
+
+    gum style --foreground 220 "Iteration $new_iter/$max recorded"
+}
+
+# Mark block as done
+cmd_done() {
+    local board=$(find_board)
+    local block_id="${1:-}"
+
+    if [[ -z "$block_id" ]]; then
+        block_id=$(jq -r '.blocks[] | select(.state == "in_progress" or .state == "testing") | .id' "$board" | head -1)
+    fi
+
+    if [[ -z "$block_id" ]]; then
+        gum style --foreground 196 "No block to mark done"
+        exit 1
+    fi
+
+    local promise=$(jq -r --arg id "$block_id" '.blocks[] | select(.id == $id) | .completion_promise' "$board")
+    echo ""
+    gum style --foreground 81 "Completion promise:" "$promise"
+    echo ""
+
+    gum confirm "Is this promise met?" || { gum style --foreground 220 "Keep working!"; exit 0; }
+
+    jq --arg id "$block_id" '
+        (.blocks[] | select(.id == $id)).state = "done" |
+        .updated = (now | todate)
+    ' "$board" > "${board}.tmp" && mv "${board}.tmp" "$board"
+
+    gum style --foreground 82 "Block '$block_id' marked DONE!"
+    cmd_board
+}
+
+# Mark block as blocked
+cmd_blocked() {
+    local board=$(find_board)
+    local block_id="${1:-}"
+    local reason="${2:-}"
+
+    if [[ -z "$block_id" ]]; then
+        block_id=$(jq -r '.blocks[] | select(.state == "in_progress") | .id' "$board" | head -1)
+    fi
+
+    if [[ -z "$reason" ]]; then
+        reason=$(gum input --placeholder "Why is this blocked?")
+    fi
+
+    jq --arg id "$block_id" --arg reason "BLOCKED: $reason" '
+        (.blocks[] | select(.id == $id)).state = "blocked" |
+        (.blocks[] | select(.id == $id)).notes += [$reason] |
+        .updated = (now | todate)
+    ' "$board" > "${board}.tmp" && mv "${board}.tmp" "$board"
+
+    gum style --foreground 196 "Block '$block_id' marked BLOCKED: $reason"
+}
+
+# Show block details
+cmd_show() {
+    local board=$(find_board)
+    local block_id="${1:-}"
+
+    if [[ -z "$block_id" ]]; then
+        local all_blocks=$(jq -r '.blocks[] | .id + " - " + .title + " [" + .state + "]"' "$board")
+        local choice=$(echo "$all_blocks" | gum choose --header "Select a block:")
+        block_id=$(echo "$choice" | cut -d' ' -f1)
+    fi
+
+    jq --arg id "$block_id" '.blocks[] | select(.id == $id)' "$board" | gum pager
+}
+
+# Main
+check_deps
+
+case "${1:-board}" in
+    board|b)     cmd_board ;;
+    init|i)      cmd_init "${2:-}" ;;
+    add|a)       cmd_add ;;
+    pick|p)      cmd_pick ;;
+    iterate|it)  cmd_iterate "${2:-}" ;;
+    done|d)      cmd_done "${2:-}" ;;
+    blocked|bl)  cmd_blocked "${2:-}" "${3:-}" ;;
+    show|s)      cmd_show "${2:-}" ;;
+    help|h|--help|-h)
+        gum style --border rounded --padding "1 2" \
+            "ralph - Ralph Wiggum Board TUI" \
+            "" \
+            "Commands:" \
+            "  board, b          Show the board" \
+            "  init, i [name]    Initialize new board" \
+            "  add, a            Add a block interactively" \
+            "  pick, p           Pick a block to work on" \
+            "  iterate, it [msg] Record an iteration" \
+            "  done, d [id]      Mark block as done" \
+            "  blocked, bl [id]  Mark block as blocked" \
+            "  show, s [id]      Show block details" \
+            "" \
+            "Environment:" \
+            "  RALPH_BOARD       Path to board file (default: .ralph-board.json)"
+        ;;
+    *)
+        gum style --foreground 196 "Unknown command: $1"
+        exit 1
+        ;;
+esac

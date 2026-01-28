@@ -1,0 +1,10 @@
+# OS files
+.DS_Store
+
+# Editor files
+*.swp
+*~
+
+# Nested git repos - clone these separately
+mcp-servers/superdesign-mcp/
+plugins/marketplaces/
